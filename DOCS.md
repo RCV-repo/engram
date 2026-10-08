@@ -703,7 +703,7 @@ Response:
 
 ### Environment Variables
 
-Release update checks are skipped for `version`, `--version`, `-v`, `help`, `--help`, and `-h`. `engram tui` performs its single update check from inside the TUI. Set `ENGRAM_NO_UPDATE_CHECK=1` to disable every update check, including the TUI check.
+Release update checks are skipped for `mcp`, `serve`, `cloud serve`, `protocol-mode`, `tui`, `doctor`, `instance-id`, `init`, `hook`, `version`, `--version`, `-v`, `help`, `--help`, and `-h`. `engram tui` performs its single update check from inside the TUI. The Claude Code hook scripts export `ENGRAM_NO_UPDATE_CHECK=1` before calling the binary, so `sync --import` run from a hook skips the check too. Set `ENGRAM_NO_UPDATE_CHECK=1` to disable every update check, including the TUI check.
 
 | Variable                        | Description                                                                                                                                                                                                                                               | Default              |
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
@@ -1211,7 +1211,7 @@ Save structured observations. The tool description teaches agents the format:
 - **content**: Structured with `**What**`, `**Why**`, `**Where**`, `**Learned**`; required unless the legacy `observation` alias is provided
 - **observation**: backward-compatible alias for `content` for older/raw MCP clients; prefer `content` for new integrations
 
-Exact duplicate saves are deduplicated in a rolling time window using a normalized content hash + project + scope + type + title.
+Duplicate saves are deduplicated in a rolling time window using a normalized content hash + project + scope + type + title; the title is compared after lowercasing and collapsing whitespace, so only the first spelling is kept.
 When `topic_key` is provided, `mem_save` upserts the latest observation in the same `project + scope + topic_key`, incrementing `revision_count` and attributing it to the latest writer session.
 Save responses include lifecycle metadata for the saved observation: computed `state` (`active` or `needs_review`) and `review_after` when the observation type has a review cycle. Content is redacted before the configured storage limit is applied; that limit and truncation metadata (`original_bytes`, `limit_bytes`) are UTF-8 bytes. MCP save/update responses include `truncated`, and warn when truncation occurs.
 
@@ -1562,6 +1562,8 @@ Use `engram projects rescue-ownership --project <name> [--session <id>] [--obser
 
 - Searches across title, content, tool_name, type, and project
 - Query sanitization: wraps each word in quotes to avoid FTS5 syntax errors
+- Sentence punctuation glued to a word is ignored at its edges (`usuarios.`, `(jwt)`, `token,` find `usuarios`, `jwt`, `token`); `+`, `#` and `$` are part of the word (`C++`, `C#`, `$HOME` are searched literally; `.NET` searches `NET`); symbol-only words such as `->` or `%` are searched literally; words made only of sentence punctuation are ignored
+- A query with nothing searchable (only whitespace, quotes or sentence punctuation) returns no results instead of an error
 - Supports type and project filters
 
 ### Timeline (Progressive Disclosure)

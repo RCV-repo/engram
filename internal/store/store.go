@@ -3990,20 +3990,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 		}
 
 		window := dedupeWindowExpression(s.cfg.DedupeWindow)
-		var existingID int64
-		err := tx.QueryRow(
-			`SELECT id FROM observations
-			 WHERE normalized_hash = ?
-			   AND ifnull(project, '') = ifnull(?, '')
-			   AND scope = ?
-			   AND type = ?
-			   AND title = ?
-			   AND deleted_at IS NULL
-			   AND datetime(created_at) >= datetime('now', ?)
-			 ORDER BY created_at DESC
-			 LIMIT 1`,
-			normHash, nullableString(p.Project), scope, p.Type, title, window,
-		).Scan(&existingID)
+		existingID, err := s.findDuplicateObservationTx(tx, normHash, p.Project, scope, p.Type, title, window)
 		if err == nil {
 			if _, err := s.execHook(tx,
 				`UPDATE observations
@@ -4632,6 +4619,12 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 		limit = 10
 	}
 
+	if query != "" && len(searchTerms(query)) == 0 {
+		// Nothing searchable (only whitespace, quotes or sentence punctuation):
+		// no prompt can match, so answer empty instead of sending FTS5 an
+		// empty MATCH that fails with a syntax error.
+		return nil, nil
+	}
 	var sql string
 	var args []any
 	if hasShortFTSTerm(query) {
@@ -5375,6 +5368,14 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 		}
 	}
 
+	terms := searchTerms(query)
+	if query != "" && len(terms) == 0 {
+		// Nothing searchable (only whitespace, quotes or sentence punctuation):
+		// no row can match, so answer with the direct topic-key hits (if any)
+		// instead of sending FTS5 an empty MATCH that fails with a syntax
+		// error. An empty query string stays an error for its caller.
+		return directResults, nil
+	}
 	var sqlQ string
 	var args []any
 	if hasShortFTSTerm(query) {
@@ -5383,7 +5384,7 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 		// Build FTS5 query: "all" (default) uses AND semantics; "any" uses OR for broader recall.
 		var ftsQuery string
 		if opts.MatchMode == "any" {
-			ftsQuery = sanitizeFTSCandidates(query)
+			ftsQuery = sanitizeFTSCandidates(strings.Join(terms, " "))
 		} else {
 			ftsQuery = sanitizeFTS(query)
 		}
@@ -5516,6 +5517,12 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
 		}
 	}
 
+	terms := searchTerms(query)
+	if query != "" && len(terms) == 0 {
+		// See SearchContext: nothing searchable answers empty, not with an
+		// FTS5 syntax error.
+		return directResults, nil
+	}
 	var sqlQ string
 	var args []any
 	if hasShortFTSTerm(query) {
@@ -5523,7 +5530,7 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
 	} else {
 		ftsQuery := sanitizeFTS(query)
 		if opts.MatchMode == "any" {
-			ftsQuery = sanitizeFTSCandidates(query)
+			ftsQuery = sanitizeFTSCandidates(strings.Join(terms, " "))
 		}
 		sqlQ, args = buildSearchPreviewFTSQuery(ftsQuery, opts, limit)
 	}
@@ -5659,15 +5666,43 @@ func hasShortFTSTerm(query string) bool {
 	return false
 }
 
+// searchTerms splits a query into the terms the FTS query, the match_mode=any
+// candidate query and the short-term LIKE fallback all agree on. Each quoted
+// phrase is a literal substring match under the trigram tokenizer, so
+// punctuation glued to a word ("usuarios.", "(jwt)", "token,") would have to
+// appear verbatim in the stored text. Per whitespace-separated word:
+//   - surrounding double quotes are removed;
+//   - a word that contains a letter or digit loses sentence punctuation from
+//     its edges only (. , ; : ! ? ( ) [ ] { } " ' * -), so "go," -> "go",
+//     "--flag" -> "flag", "it's" and "foo-bar" are kept; + # $ are never
+//     stripped, so "C++", "C#" and "$HOME" stay literal (".NET" -> "NET");
+//   - a word made only of sentence punctuation ("...", "?", "--") is dropped;
+//   - any other symbol-only word ("->", "%", "&&") is kept verbatim so the
+//     LIKE fallback can still find it literally.
 func searchTerms(query string) []string {
 	var terms []string
 	for _, term := range strings.Fields(query) {
 		term = strings.Trim(term, `"`)
-		if term != "" {
-			terms = append(terms, term)
+		trimmed := strings.TrimFunc(term, isSentencePunctuation)
+		if trimmed == "" {
+			continue
 		}
+		if strings.ContainsFunc(term, isSearchableRune) {
+			term = trimmed
+		}
+		terms = append(terms, term)
 	}
 	return terms
+}
+
+func isSearchableRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r)
+}
+
+// isSentencePunctuation lists the punctuation that is stripped from the edges
+// of a word. It deliberately excludes + # $ and every other symbol.
+func isSentencePunctuation(r rune) bool {
+	return strings.ContainsRune(".,;:!?()[]{}\"'*-", r)
 }
 
 func escapeLIKE(term string) string {
@@ -12873,10 +12908,12 @@ func normalizeTopicKey(topic string) string {
 		return ""
 	}
 	v = strings.Join(strings.Fields(v), "-")
-	if len(v) > 120 {
-		v = v[:120]
-	}
-	return v
+	// The budget stays 120 bytes so every key that was already valid keeps
+	// the exact value earlier builds stored (topic upserts compare keys
+	// verbatim). Only the cut moves back to the nearest rune boundary: a
+	// plain byte slice could split a multi-byte character and persist an
+	// invalid UTF-8 key.
+	return truncateUTF8Prefix(v, 120)
 }
 
 func derefString(v *string) string {
@@ -12884,6 +12921,51 @@ func derefString(v *string) string {
 		return ""
 	}
 	return *v
+}
+
+// findDuplicateObservationTx returns the newest live observation inside the
+// dedupe window with the same content hash, project, scope and type whose
+// title matches after case folding and whitespace collapsing. The content is
+// already compared through normalized_hash; without the same treatment for the
+// title, "Fix auth", "fix auth" and "Fix  auth" became three rows for one save.
+// It returns sql.ErrNoRows when nothing matches.
+func (s *Store) findDuplicateObservationTx(tx *sql.Tx, normHash, project, scope, typ, title, window string) (int64, error) {
+	rows, err := tx.Query(
+		`SELECT id, title FROM observations
+		 WHERE normalized_hash = ?
+		   AND ifnull(project, '') = ifnull(?, '')
+		   AND scope = ?
+		   AND type = ?
+		   AND deleted_at IS NULL
+		   AND datetime(created_at) >= datetime('now', ?)
+		 ORDER BY created_at DESC`,
+		normHash, nullableString(project), scope, typ, window,
+	)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = rows.Close() }()
+	want := normalizeTitleForDedupe(title)
+	for rows.Next() {
+		var id int64
+		var candidate string
+		if err := rows.Scan(&id, &candidate); err != nil {
+			return 0, err
+		}
+		if normalizeTitleForDedupe(candidate) == want {
+			return id, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	return 0, sql.ErrNoRows
+}
+
+// normalizeTitleForDedupe applies the same folding hashNormalized applies to
+// content: lowercase and single-space separated.
+func normalizeTitleForDedupe(title string) string {
+	return strings.ToLower(strings.Join(strings.Fields(title), " "))
 }
 
 func hashNormalized(content string) string {
@@ -12953,19 +13035,19 @@ func stripPrivateTags(s string) string {
 	return result
 }
 
-// sanitizeFTS wraps each word in quotes so FTS5 doesn't choke on special chars.
-// "fix auth bug" → `"fix" "auth" "bug"`
+// sanitizeFTS wraps each searchable word in quotes so FTS5 doesn't choke on
+// special chars. "fix auth bug" → `"fix" "auth" "bug"`. The words come from
+// searchTerms, so the FTS query and the LIKE fallback look for the same text
+// (see searchTerms for what is stripped from a word's edges).
 func sanitizeFTS(query string) string {
-	words := strings.Fields(query)
-	for i, w := range words {
-		// Strip existing quotes to avoid double-quoting
-		w = strings.Trim(w, `"`)
+	words := make([]string, 0, 4)
+	for _, w := range searchTerms(query) {
 		// Double interior double-quotes: FTS5 escapes a literal " inside a
 		// quoted phrase by doubling it (""). Without this, `hello"world`
 		// becomes `"hello"world"` — an unterminated string literal that crashes
 		// the query with "SQL logic error: unterminated string". See #574.
 		w = strings.ReplaceAll(w, `"`, `""`)
-		words[i] = `"` + w + `"`
+		words = append(words, `"`+w+`"`)
 	}
 	return strings.Join(words, " ")
 }

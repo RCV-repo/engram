@@ -2,6 +2,14 @@
 # Engram — Shared helpers for Claude Code hooks
 # WARNING: Do not read from stdin here — scripts source this before reading their hook input.
 
+# Hook scripts call the binary from SessionStart: `instance-id` when the hook
+# manages the local server (ENGRAM_MANAGED_LOCAL=1), `sync --import` when the
+# cwd has .engram/manifest.json, and `protocol-mode` always. Those calls are
+# machine-facing: skip the GitHub release check so an offline or rate-limited
+# machine does not spend the hook's time budget (up to 2s per call) on it and
+# no update notice lands in hook output.
+export ENGRAM_NO_UPDATE_CHECK=1
+
 trim_whitespace() {
   local value="$1"
   value="${value#"${value%%[![:space:]]*}"}"

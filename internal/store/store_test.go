@@ -2575,6 +2575,47 @@ func TestAddObservationDeduplicatesWithinWindow(t *testing.T) {
 	}
 }
 
+// TestAddObservationDeduplicatesTitleCaseAndWhitespace pins that the title
+// comparison folds case and whitespace the way the content hash already does,
+// so re-saving the same memory with a cosmetically different title updates the
+// existing row instead of creating a new one.
+func TestAddObservationDeduplicatesTitleCaseAndWhitespace(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-title-dedupe", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	save := func(title string) int64 {
+		t.Helper()
+		id, err := s.AddObservation(AddObservationParams{
+			SessionID: "s-title-dedupe", Type: "decision", Title: title,
+			Content: "Use JWT for auth", Project: "engram", Scope: "project",
+		})
+		if err != nil {
+			t.Fatalf("add observation %q: %v", title, err)
+		}
+		return id
+	}
+	first := save("Fix auth")
+	for _, title := range []string{"fix auth", "Fix  auth", "  FIX AUTH  "} {
+		if got := save(title); got != first {
+			t.Fatalf("title %q created observation %d, want duplicate of %d", title, got, first)
+		}
+	}
+	obs, err := s.GetObservation(first)
+	if err != nil {
+		t.Fatalf("get observation: %v", err)
+	}
+	if obs.DuplicateCount != 4 {
+		t.Fatalf("duplicate_count = %d, want 4", obs.DuplicateCount)
+	}
+	if obs.Title != "Fix auth" {
+		t.Fatalf("title = %q, want the first spelling kept", obs.Title)
+	}
+	if got := save("Fix auth v2"); got == first {
+		t.Fatal("a genuinely different title must not be treated as a duplicate")
+	}
+}
+
 func TestObservationWritesStoreProjectAsText(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("s-project-storage", "engram", "/tmp/engram"); err != nil {
@@ -2640,6 +2681,79 @@ func TestUpdateObservationPreservesProjectAsTextAndProjectVisibility(t *testing.
 	if len(observations) != 1 || observations[0].ID != id {
 		t.Fatalf("project observations = %+v, want observation %d", observations, id)
 	}
+}
+
+// TestNormalizeTopicKeyCutsOnRuneBoundaryWithinByteBudget pins the topic key
+// truncation fix without changing any key that was already valid. The budget
+// is 120 bytes, as before: a byte slice at 120 could split a multi-byte
+// character and persist invalid UTF-8, while a 120-rune cut (up to 480 bytes)
+// would change the key of every long multi-byte topic saved by earlier builds
+// and turn their upserts into duplicate rows.
+func TestNormalizeTopicKeyCutsOnRuneBoundaryWithinByteBudget(t *testing.T) {
+	// legacyKey is what main stored for this topic: lower-case, fields joined
+	// with "-", then v[:120] (the cut lands on an ASCII "a", so it was valid).
+	topic := "decisión/" + strings.Repeat("a", 130)
+	legacyKey := strings.Join(strings.Fields(strings.ToLower(topic)), "-")[:120]
+	if !utf8.ValidString(legacyKey) || len(legacyKey) != 120 {
+		t.Fatalf("test fixture: legacy key must be a valid 120-byte key, got %d bytes", len(legacyKey))
+	}
+
+	t.Run("cut inside a rune moves back to the rune boundary", func(t *testing.T) {
+		accented := normalizeTopicKey("decision/" + strings.Repeat("é", 150))
+		if !utf8.ValidString(accented) {
+			t.Fatalf("expected a valid UTF-8 topic key, got %q", accented)
+		}
+		if len(accented) > 120 {
+			t.Fatalf("expected at most 120 bytes, got %d", len(accented))
+		}
+		if !strings.HasPrefix(accented, "decision/é") {
+			t.Fatalf("expected the key to keep its prefix, got %q", accented)
+		}
+	})
+
+	t.Run("key that was valid under the byte cut is unchanged", func(t *testing.T) {
+		if got := normalizeTopicKey(topic); got != legacyKey {
+			t.Fatalf("normalizeTopicKey changed a key that was already valid: got %q (%d bytes), want %q (%d bytes)", got, len(got), legacyKey, len(legacyKey))
+		}
+	})
+
+	t.Run("row stored with the legacy key is still the upsert target", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("s-topic-bytes", "engram", "/tmp/engram"); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		first, err := s.AddObservation(AddObservationParams{
+			SessionID: "s-topic-bytes", Type: "decision", Title: "Long topic v1",
+			Content: "first revision", Project: "engram", Scope: "project", TopicKey: legacyKey,
+		})
+		if err != nil {
+			t.Fatalf("seed observation with legacy key: %v", err)
+		}
+		before, err := s.GetObservation(first)
+		if err != nil {
+			t.Fatalf("get seeded observation: %v", err)
+		}
+		second, err := s.AddObservation(AddObservationParams{
+			SessionID: "s-topic-bytes", Type: "decision", Title: "Long topic v2",
+			Content: "second revision", Project: "engram", Scope: "project", TopicKey: topic,
+		})
+		if err != nil {
+			t.Fatalf("re-save observation with the untruncated topic: %v", err)
+		}
+		if second != first {
+			t.Fatalf("re-saving the topic created observation %d instead of upserting %d", second, first)
+		}
+		obs, err := s.GetObservation(first)
+		if err != nil {
+			t.Fatalf("get observation: %v", err)
+		}
+		if obs.RevisionCount != before.RevisionCount+1 || obs.Title != "Long topic v2" {
+			t.Fatalf("expected one upsert revision with the new title, got revision_count=%d (was %d) title=%q", obs.RevisionCount, before.RevisionCount, obs.Title)
+		}
+		if obs.TopicKey == nil || *obs.TopicKey != legacyKey {
+			t.Fatalf("stored topic key = %v, want the legacy key", obs.TopicKey)
+		}
+	})
 }
 
 func TestAddObservationRejectsBlankTitleBeforePersistenceAndSync(t *testing.T) {
@@ -18587,9 +18701,20 @@ func TestSanitizeFTS(t *testing.T) {
 		{"interior double-quote (the bug)", `foo"bar`, `"foo""bar"`},
 		{"already quoted", `"hello"`, `"hello"`},
 		{"multiple interior quotes", `a"b"c`, `"a""b""c"`},
-		{"just quotes", `""`, `""`},
+		{"just quotes", `""`, ""},
 		{"mixed quote and plain", `hello"world test`, `"hello""world" "test"`},
 		{"empty input", "", ""},
+		{"trailing period", "usuarios.", `"usuarios"`},
+		{"wrapped in parentheses", "(jwt)", `"jwt"`},
+		{"trailing comma and colon", "jwt, token:", `"jwt" "token"`},
+		{"glob star is not an operator", "auth*", `"auth"`},
+		{"interior hyphen kept", "foo-bar", `"foo-bar"`},
+		{"leading dashes stripped", "--flag", `"flag"`},
+		{"accented word with punctuation", "autenticación,", `"autenticación"`},
+		{"symbol-only words are kept literally", "-> &&", `"->" "&&"`},
+		{"sentence punctuation alone is dropped", "jwt ?", `"jwt"`},
+		{"plus and hash are part of the word", "C++ C# F#", `"C++" "C#" "F#"`},
+		{"leading dot is sentence punctuation", ".NET", `"NET"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -19562,5 +19687,163 @@ func TestRuntimeSessionLeaseStaysOutOfSyncAndExportPayloads(t *testing.T) {
 	}
 	if strings.Contains(string(exportPayload), "runtime_lease_expires_at") {
 		t.Fatalf("export leaked runtime lease: %s", exportPayload)
+	}
+}
+
+// TestSearchTermsStripEdgePunctuation pins that punctuation glued to a word
+// does not change what the trigram FTS query or the LIKE fallback look for,
+// while programmer symbols (+ # $) and symbol-only words stay literal.
+func TestSearchTermsStripEdgePunctuation(t *testing.T) {
+	got := searchTerms(`"JWT:" (auth), token. -> --flag it's % C++ C# $HOME .NET ... ?`)
+	want := []string{"JWT", "auth", "token", "->", "flag", "it's", "%", "C++", "C#", "$HOME", "NET"}
+	if len(got) != len(want) {
+		t.Fatalf("searchTerms = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("searchTerms = %q, want %q", got, want)
+		}
+	}
+	if !hasShortFTSTerm("go,") {
+		t.Fatal("expected short-term detection to ignore the trailing comma")
+	}
+	for _, query := range []string{"   ", `"`, `""`, `"""`, `" "`, "...", "?", "--", "!!"} {
+		if terms := searchTerms(query); len(terms) != 0 {
+			t.Fatalf("searchTerms(%q) = %q, want no searchable terms", query, terms)
+		}
+	}
+}
+
+// TestSearchFindsTermsWithGluedPunctuation reproduces the agent-facing symptom:
+// a natural-language query such as "JWT auth?" or "fix login, token." returned
+// nothing because each quoted phrase had to match the punctuation verbatim.
+func TestSearchFindsTermsWithGluedPunctuation(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-punct", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-punct", Type: "decision", Title: "Chose JWT for auth",
+		Content: "Decidimos usar JWT para la autenticación de usuarios", Project: "engram", Scope: "project",
+	}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	if _, err := s.AddPrompt(AddPromptParams{SessionID: "s-punct", Content: "configura JWT para los usuarios", Project: "engram"}); err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+
+	for _, query := range []string{"usuarios.", "(jwt)", "jwt,", "JWT:", "jwt auth?", "auth*", "jwt ?"} {
+		for _, mode := range []string{"", "any"} {
+			results, err := s.Search(query, SearchOptions{Project: "engram", Limit: 10, MatchMode: mode})
+			if err != nil {
+				t.Fatalf("Search(%q, %q): %v", query, mode, err)
+			}
+			if len(results) != 1 {
+				t.Fatalf("Search(%q, %q) returned %d results, want 1", query, mode, len(results))
+			}
+			previews, err := s.SearchPreviewsContext(context.Background(), query, SearchOptions{Project: "engram", Limit: 10, MatchMode: mode})
+			if err != nil {
+				t.Fatalf("SearchPreviews(%q, %q): %v", query, mode, err)
+			}
+			if len(previews) != 1 {
+				t.Fatalf("SearchPreviews(%q, %q) returned %d results, want 1", query, mode, len(previews))
+			}
+		}
+	}
+	prompts, err := s.SearchPrompts("usuarios.", "engram", 10)
+	if err != nil {
+		t.Fatalf("SearchPrompts: %v", err)
+	}
+	if len(prompts) != 1 {
+		t.Fatalf("SearchPrompts returned %d prompts, want 1", len(prompts))
+	}
+}
+
+// TestSearchKeepsProgrammerSymbolsLiteral pins that "C++", "C#" and "go," behave
+// as a programmer expects: + and # belong to the word (stripping them would
+// turn "C++" into the short term "C" and match every row with a "c"), while a
+// trailing comma does not stop "go," from finding "go".
+func TestSearchKeepsProgrammerSymbolsLiteral(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-symbols", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	for _, p := range []AddObservationParams{
+		{SessionID: "s-symbols", Type: "decision", Title: "Chose JWT for auth", Content: "clean cache code", Project: "engram", Scope: "project"},
+		{SessionID: "s-symbols", Type: "decision", Title: "Compliance notes", Content: "cache and cookies", Project: "engram", Scope: "project"},
+		{SessionID: "s-symbols", Type: "decision", Title: "Go release", Content: "we ship go binaries", Project: "engram", Scope: "project"},
+	} {
+		if _, err := s.AddObservation(p); err != nil {
+			t.Fatalf("seed %q: %v", p.Title, err)
+		}
+	}
+	count := func(query, mode string) int {
+		t.Helper()
+		results, err := s.Search(query, SearchOptions{Project: "engram", Limit: 10, MatchMode: mode})
+		if err != nil {
+			t.Fatalf("Search(%q, %q): %v", query, mode, err)
+		}
+		return len(results)
+	}
+	for _, mode := range []string{"", "any"} {
+		if got := count("C++", mode); got != 0 {
+			t.Fatalf("Search(C++, %q) over rows that only contain a plain c returned %d results, want 0", mode, got)
+		}
+		if got := count("C#", mode); got != 0 {
+			t.Fatalf("Search(C#, %q) over rows that only contain a plain c returned %d results, want 0", mode, got)
+		}
+		if got := count("go,", mode); got != 1 {
+			t.Fatalf("Search(go, %q) returned %d results, want the Go release row", mode, got)
+		}
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-symbols", Type: "decision", Title: "Systems language", Content: "C++ rocks for systems code, C# for tooling", Project: "engram", Scope: "project",
+	}); err != nil {
+		t.Fatalf("seed C++ row: %v", err)
+	}
+	for _, mode := range []string{"", "any"} {
+		if got := count("C++", mode); got != 1 {
+			t.Fatalf("Search(C++, %q) returned %d results, want only the C++ row", mode, got)
+		}
+		if got := count("C#", mode); got != 1 {
+			t.Fatalf("Search(C#, %q) returned %d results, want only the C# row", mode, got)
+		}
+	}
+}
+
+// TestSearchWithoutSearchableTermsReturnsNoRows pins the deliberate behavior
+// for a non-empty query that leaves nothing searchable (only whitespace, quotes
+// or sentence punctuation): an empty result without error, instead of the
+// "fts5: syntax error" that whitespace (both modes) and quotes (match_mode=any)
+// used to surface. The empty string itself keeps its existing error for
+// match_mode=any (TestSearchMatchMode_EmptyQueryAnyReturnsError).
+func TestSearchWithoutSearchableTermsReturnsNoRows(t *testing.T) {
+	s := newTestStore(t)
+	seedMatchModeFixture(t, s)
+
+	for _, query := range []string{"   ", `"`, `""`, `"""`, `" "`, "...", "?!"} {
+		for _, mode := range []string{"", "any"} {
+			results, err := s.Search(query, SearchOptions{Project: "engram", Limit: 10, MatchMode: mode})
+			if err != nil {
+				t.Fatalf("Search(%q, %q) error = %v, want none", query, mode, err)
+			}
+			if len(results) != 0 {
+				t.Fatalf("Search(%q, %q) returned %d results, want 0", query, mode, len(results))
+			}
+			previews, err := s.SearchPreviewsContext(context.Background(), query, SearchOptions{Project: "engram", Limit: 10, MatchMode: mode})
+			if err != nil {
+				t.Fatalf("SearchPreviews(%q, %q) error = %v, want none", query, mode, err)
+			}
+			if len(previews) != 0 {
+				t.Fatalf("SearchPreviews(%q, %q) returned %d results, want 0", query, mode, len(previews))
+			}
+		}
+		prompts, err := s.SearchPrompts(query, "engram", 10)
+		if err != nil {
+			t.Fatalf("SearchPrompts(%q) error = %v, want none", query, err)
+		}
+		if len(prompts) != 0 {
+			t.Fatalf("SearchPrompts(%q) returned %d prompts, want 0", query, len(prompts))
+		}
 	}
 }
