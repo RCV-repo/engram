@@ -1562,6 +1562,8 @@ Use `engram projects rescue-ownership --project <name> [--session <id>] [--obser
 
 - Searches across title, content, tool_name, type, and project
 - Query sanitization: wraps each word in quotes to avoid FTS5 syntax errors
+- Sentence punctuation glued to a word is ignored at its edges (`usuarios.`, `(jwt)`, `token,` find `usuarios`, `jwt`, `token`); `+`, `#` and `$` are part of the word (`C++`, `C#`, `$HOME` are searched literally; `.NET` searches `NET`); symbol-only words such as `->` or `%` are searched literally; words made only of sentence punctuation are ignored
+- A query with nothing searchable (only whitespace, quotes or sentence punctuation) returns no results instead of an error
 - Supports type and project filters
 
 ### Timeline (Progressive Disclosure)

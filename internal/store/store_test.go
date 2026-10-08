@@ -18701,9 +18701,20 @@ func TestSanitizeFTS(t *testing.T) {
 		{"interior double-quote (the bug)", `foo"bar`, `"foo""bar"`},
 		{"already quoted", `"hello"`, `"hello"`},
 		{"multiple interior quotes", `a"b"c`, `"a""b""c"`},
-		{"just quotes", `""`, `""`},
+		{"just quotes", `""`, ""},
 		{"mixed quote and plain", `hello"world test`, `"hello""world" "test"`},
 		{"empty input", "", ""},
+		{"trailing period", "usuarios.", `"usuarios"`},
+		{"wrapped in parentheses", "(jwt)", `"jwt"`},
+		{"trailing comma and colon", "jwt, token:", `"jwt" "token"`},
+		{"glob star is not an operator", "auth*", `"auth"`},
+		{"interior hyphen kept", "foo-bar", `"foo-bar"`},
+		{"leading dashes stripped", "--flag", `"flag"`},
+		{"accented word with punctuation", "autenticación,", `"autenticación"`},
+		{"symbol-only words are kept literally", "-> &&", `"->" "&&"`},
+		{"sentence punctuation alone is dropped", "jwt ?", `"jwt"`},
+		{"plus and hash are part of the word", "C++ C# F#", `"C++" "C#" "F#"`},
+		{"leading dot is sentence punctuation", ".NET", `"NET"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -19676,5 +19687,163 @@ func TestRuntimeSessionLeaseStaysOutOfSyncAndExportPayloads(t *testing.T) {
 	}
 	if strings.Contains(string(exportPayload), "runtime_lease_expires_at") {
 		t.Fatalf("export leaked runtime lease: %s", exportPayload)
+	}
+}
+
+// TestSearchTermsStripEdgePunctuation pins that punctuation glued to a word
+// does not change what the trigram FTS query or the LIKE fallback look for,
+// while programmer symbols (+ # $) and symbol-only words stay literal.
+func TestSearchTermsStripEdgePunctuation(t *testing.T) {
+	got := searchTerms(`"JWT:" (auth), token. -> --flag it's % C++ C# $HOME .NET ... ?`)
+	want := []string{"JWT", "auth", "token", "->", "flag", "it's", "%", "C++", "C#", "$HOME", "NET"}
+	if len(got) != len(want) {
+		t.Fatalf("searchTerms = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("searchTerms = %q, want %q", got, want)
+		}
+	}
+	if !hasShortFTSTerm("go,") {
+		t.Fatal("expected short-term detection to ignore the trailing comma")
+	}
+	for _, query := range []string{"   ", `"`, `""`, `"""`, `" "`, "...", "?", "--", "!!"} {
+		if terms := searchTerms(query); len(terms) != 0 {
+			t.Fatalf("searchTerms(%q) = %q, want no searchable terms", query, terms)
+		}
+	}
+}
+
+// TestSearchFindsTermsWithGluedPunctuation reproduces the agent-facing symptom:
+// a natural-language query such as "JWT auth?" or "fix login, token." returned
+// nothing because each quoted phrase had to match the punctuation verbatim.
+func TestSearchFindsTermsWithGluedPunctuation(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-punct", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-punct", Type: "decision", Title: "Chose JWT for auth",
+		Content: "Decidimos usar JWT para la autenticación de usuarios", Project: "engram", Scope: "project",
+	}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	if _, err := s.AddPrompt(AddPromptParams{SessionID: "s-punct", Content: "configura JWT para los usuarios", Project: "engram"}); err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+
+	for _, query := range []string{"usuarios.", "(jwt)", "jwt,", "JWT:", "jwt auth?", "auth*", "jwt ?"} {
+		for _, mode := range []string{"", "any"} {
+			results, err := s.Search(query, SearchOptions{Project: "engram", Limit: 10, MatchMode: mode})
+			if err != nil {
+				t.Fatalf("Search(%q, %q): %v", query, mode, err)
+			}
+			if len(results) != 1 {
+				t.Fatalf("Search(%q, %q) returned %d results, want 1", query, mode, len(results))
+			}
+			previews, err := s.SearchPreviewsContext(context.Background(), query, SearchOptions{Project: "engram", Limit: 10, MatchMode: mode})
+			if err != nil {
+				t.Fatalf("SearchPreviews(%q, %q): %v", query, mode, err)
+			}
+			if len(previews) != 1 {
+				t.Fatalf("SearchPreviews(%q, %q) returned %d results, want 1", query, mode, len(previews))
+			}
+		}
+	}
+	prompts, err := s.SearchPrompts("usuarios.", "engram", 10)
+	if err != nil {
+		t.Fatalf("SearchPrompts: %v", err)
+	}
+	if len(prompts) != 1 {
+		t.Fatalf("SearchPrompts returned %d prompts, want 1", len(prompts))
+	}
+}
+
+// TestSearchKeepsProgrammerSymbolsLiteral pins that "C++", "C#" and "go," behave
+// as a programmer expects: + and # belong to the word (stripping them would
+// turn "C++" into the short term "C" and match every row with a "c"), while a
+// trailing comma does not stop "go," from finding "go".
+func TestSearchKeepsProgrammerSymbolsLiteral(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-symbols", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	for _, p := range []AddObservationParams{
+		{SessionID: "s-symbols", Type: "decision", Title: "Chose JWT for auth", Content: "clean cache code", Project: "engram", Scope: "project"},
+		{SessionID: "s-symbols", Type: "decision", Title: "Compliance notes", Content: "cache and cookies", Project: "engram", Scope: "project"},
+		{SessionID: "s-symbols", Type: "decision", Title: "Go release", Content: "we ship go binaries", Project: "engram", Scope: "project"},
+	} {
+		if _, err := s.AddObservation(p); err != nil {
+			t.Fatalf("seed %q: %v", p.Title, err)
+		}
+	}
+	count := func(query, mode string) int {
+		t.Helper()
+		results, err := s.Search(query, SearchOptions{Project: "engram", Limit: 10, MatchMode: mode})
+		if err != nil {
+			t.Fatalf("Search(%q, %q): %v", query, mode, err)
+		}
+		return len(results)
+	}
+	for _, mode := range []string{"", "any"} {
+		if got := count("C++", mode); got != 0 {
+			t.Fatalf("Search(C++, %q) over rows that only contain a plain c returned %d results, want 0", mode, got)
+		}
+		if got := count("C#", mode); got != 0 {
+			t.Fatalf("Search(C#, %q) over rows that only contain a plain c returned %d results, want 0", mode, got)
+		}
+		if got := count("go,", mode); got != 1 {
+			t.Fatalf("Search(go, %q) returned %d results, want the Go release row", mode, got)
+		}
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-symbols", Type: "decision", Title: "Systems language", Content: "C++ rocks for systems code, C# for tooling", Project: "engram", Scope: "project",
+	}); err != nil {
+		t.Fatalf("seed C++ row: %v", err)
+	}
+	for _, mode := range []string{"", "any"} {
+		if got := count("C++", mode); got != 1 {
+			t.Fatalf("Search(C++, %q) returned %d results, want only the C++ row", mode, got)
+		}
+		if got := count("C#", mode); got != 1 {
+			t.Fatalf("Search(C#, %q) returned %d results, want only the C# row", mode, got)
+		}
+	}
+}
+
+// TestSearchWithoutSearchableTermsReturnsNoRows pins the deliberate behavior
+// for a non-empty query that leaves nothing searchable (only whitespace, quotes
+// or sentence punctuation): an empty result without error, instead of the
+// "fts5: syntax error" that whitespace (both modes) and quotes (match_mode=any)
+// used to surface. The empty string itself keeps its existing error for
+// match_mode=any (TestSearchMatchMode_EmptyQueryAnyReturnsError).
+func TestSearchWithoutSearchableTermsReturnsNoRows(t *testing.T) {
+	s := newTestStore(t)
+	seedMatchModeFixture(t, s)
+
+	for _, query := range []string{"   ", `"`, `""`, `"""`, `" "`, "...", "?!"} {
+		for _, mode := range []string{"", "any"} {
+			results, err := s.Search(query, SearchOptions{Project: "engram", Limit: 10, MatchMode: mode})
+			if err != nil {
+				t.Fatalf("Search(%q, %q) error = %v, want none", query, mode, err)
+			}
+			if len(results) != 0 {
+				t.Fatalf("Search(%q, %q) returned %d results, want 0", query, mode, len(results))
+			}
+			previews, err := s.SearchPreviewsContext(context.Background(), query, SearchOptions{Project: "engram", Limit: 10, MatchMode: mode})
+			if err != nil {
+				t.Fatalf("SearchPreviews(%q, %q) error = %v, want none", query, mode, err)
+			}
+			if len(previews) != 0 {
+				t.Fatalf("SearchPreviews(%q, %q) returned %d results, want 0", query, mode, len(previews))
+			}
+		}
+		prompts, err := s.SearchPrompts(query, "engram", 10)
+		if err != nil {
+			t.Fatalf("SearchPrompts(%q) error = %v, want none", query, err)
+		}
+		if len(prompts) != 0 {
+			t.Fatalf("SearchPrompts(%q) returned %d prompts, want 0", query, len(prompts))
+		}
 	}
 }

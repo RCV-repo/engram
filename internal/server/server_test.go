@@ -4789,3 +4789,39 @@ func TestHandleCreateSessionRenewsRuntimeLeaseAndRejectsEndedSession(t *testing.
 		t.Fatalf("ended-session response = %#v", response)
 	}
 }
+
+// TestHandleSearchWithoutSearchableTermsReturnsEmptyArray pins the HTTP
+// contract for a query the store cannot search (only whitespace, quotes or
+// sentence punctuation): 200 with [], in both match modes, instead of the 500
+// that wrapped "fts5: syntax error" for whitespace and for quotes with
+// match_mode=any. The E2E suite already fixes /search?q=%22%22%22 at 200.
+func TestHandleSearchWithoutSearchableTermsReturnsEmptyArray(t *testing.T) {
+	st := newServerTestStore(t)
+	if err := st.CreateSession("sess-unsearchable", "proj-unsearchable", "/tmp/proj-unsearchable"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := st.AddObservation(store.AddObservationParams{
+		SessionID: "sess-unsearchable", Type: "note", Title: "Aurora note",
+		Content: "alpha content", Project: "proj-unsearchable", Scope: "project",
+	}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	h := New(st, 0).Handler()
+	for _, path := range []string{
+		"/search?q=%22%22%22&project=proj-unsearchable",
+		"/search?q=%22%22%22&project=proj-unsearchable&match_mode=any",
+		"/search?q=%20%20%20&project=proj-unsearchable",
+		"/search?q=%20%20%20&project=proj-unsearchable&match_mode=any",
+		"/search?q=...&project=proj-unsearchable",
+		"/prompts/search?q=%20%20%20&project=proj-unsearchable",
+	} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status=%d body=%s, want 200", path, rec.Code, rec.Body.String())
+		}
+		if body := strings.TrimSpace(rec.Body.String()); body != "[]" {
+			t.Fatalf("%s: body=%q, want []", path, body)
+		}
+	}
+}
