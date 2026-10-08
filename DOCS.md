@@ -703,7 +703,7 @@ Response:
 
 ### Environment Variables
 
-Release update checks are skipped for `version`, `--version`, `-v`, `help`, `--help`, and `-h`. `engram tui` performs its single update check from inside the TUI. Set `ENGRAM_NO_UPDATE_CHECK=1` to disable every update check, including the TUI check.
+Release update checks are skipped for `mcp`, `serve`, `cloud serve`, `protocol-mode`, `tui`, `doctor`, `instance-id`, `init`, `hook`, `version`, `--version`, `-v`, `help`, `--help`, and `-h`. `engram tui` performs its single update check from inside the TUI. The Claude Code hook scripts export `ENGRAM_NO_UPDATE_CHECK=1` before calling the binary, so `sync --import` run from a hook skips the check too. Set `ENGRAM_NO_UPDATE_CHECK=1` to disable every update check, including the TUI check.
 
 | Variable                        | Description                                                                                                                                                                                                                                               | Default              |
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
