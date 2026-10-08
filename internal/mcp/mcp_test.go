@@ -447,6 +447,27 @@ func TestNewServerScopeDescriptions(t *testing.T) {
 	}
 }
 
+// TestNewServerContextProjectDescription pins the mem_context project text to
+// what handleContext does: an omitted project reads the current project, except
+// that scope=personal without a project clears the filter (REQ-391, covered by
+// TestHandleContextPersonalScopeIgnoresCWDProject). The old "omit for all
+// projects" text made agents believe they had read every project.
+func TestNewServerContextProjectDescription(t *testing.T) {
+	srv := NewServer(newMCPTestStore(t))
+	tool := srv.GetTool("mem_context")
+	if tool == nil {
+		t.Fatal("mem_context not registered")
+	}
+	project, ok := tool.Tool.InputSchema.Properties["project"].(map[string]any)
+	if !ok {
+		t.Fatalf("mem_context project schema = %T; want object", tool.Tool.InputSchema.Properties["project"])
+	}
+	const want = "Project to read. Omit to use the current project (process override or cwd detection). One exception: with scope=personal and no project, personal memories from every project are returned. For any other cross-project recall use mem_search with all_projects=true."
+	if got, _ := project["description"].(string); got != want {
+		t.Errorf("mem_context project description = %q; want %q", got, want)
+	}
+}
+
 func TestNewServerSessionIDDescriptions(t *testing.T) {
 	srv := NewServer(newMCPTestStore(t))
 

@@ -739,7 +739,7 @@ Examples:
 				mcp.WithIdempotentHintAnnotation(true),
 				mcp.WithOpenWorldHintAnnotation(false),
 				mcp.WithString("project",
-					mcp.Description("Filter by project (omit for all projects)"),
+					mcp.Description("Project to read. Omit to use the current project (process override or cwd detection). One exception: with scope=personal and no project, personal memories from every project are returned. For any other cross-project recall use mem_search with all_projects=true."),
 				),
 				mcp.WithString("scope",
 					mcp.Description("Filter observations by scope: project, personal, or global. Omit to apply no scope filter."),
