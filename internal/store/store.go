@@ -3990,20 +3990,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 		}
 
 		window := dedupeWindowExpression(s.cfg.DedupeWindow)
-		var existingID int64
-		err := tx.QueryRow(
-			`SELECT id FROM observations
-			 WHERE normalized_hash = ?
-			   AND ifnull(project, '') = ifnull(?, '')
-			   AND scope = ?
-			   AND type = ?
-			   AND title = ?
-			   AND deleted_at IS NULL
-			   AND datetime(created_at) >= datetime('now', ?)
-			 ORDER BY created_at DESC
-			 LIMIT 1`,
-			normHash, nullableString(p.Project), scope, p.Type, title, window,
-		).Scan(&existingID)
+		existingID, err := s.findDuplicateObservationTx(tx, normHash, p.Project, scope, p.Type, title, window)
 		if err == nil {
 			if _, err := s.execHook(tx,
 				`UPDATE observations
@@ -12884,6 +12871,51 @@ func derefString(v *string) string {
 		return ""
 	}
 	return *v
+}
+
+// findDuplicateObservationTx returns the newest live observation inside the
+// dedupe window with the same content hash, project, scope and type whose
+// title matches after case folding and whitespace collapsing. The content is
+// already compared through normalized_hash; without the same treatment for the
+// title, "Fix auth", "fix auth" and "Fix  auth" became three rows for one save.
+// It returns sql.ErrNoRows when nothing matches.
+func (s *Store) findDuplicateObservationTx(tx *sql.Tx, normHash, project, scope, typ, title, window string) (int64, error) {
+	rows, err := tx.Query(
+		`SELECT id, title FROM observations
+		 WHERE normalized_hash = ?
+		   AND ifnull(project, '') = ifnull(?, '')
+		   AND scope = ?
+		   AND type = ?
+		   AND deleted_at IS NULL
+		   AND datetime(created_at) >= datetime('now', ?)
+		 ORDER BY created_at DESC`,
+		normHash, nullableString(project), scope, typ, window,
+	)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = rows.Close() }()
+	want := normalizeTitleForDedupe(title)
+	for rows.Next() {
+		var id int64
+		var candidate string
+		if err := rows.Scan(&id, &candidate); err != nil {
+			return 0, err
+		}
+		if normalizeTitleForDedupe(candidate) == want {
+			return id, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	return 0, sql.ErrNoRows
+}
+
+// normalizeTitleForDedupe applies the same folding hashNormalized applies to
+// content: lowercase and single-space separated.
+func normalizeTitleForDedupe(title string) string {
+	return strings.ToLower(strings.Join(strings.Fields(title), " "))
 }
 
 func hashNormalized(content string) string {

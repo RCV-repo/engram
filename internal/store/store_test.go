@@ -2575,6 +2575,47 @@ func TestAddObservationDeduplicatesWithinWindow(t *testing.T) {
 	}
 }
 
+// TestAddObservationDeduplicatesTitleCaseAndWhitespace pins that the title
+// comparison folds case and whitespace the way the content hash already does,
+// so re-saving the same memory with a cosmetically different title updates the
+// existing row instead of creating a new one.
+func TestAddObservationDeduplicatesTitleCaseAndWhitespace(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-title-dedupe", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	save := func(title string) int64 {
+		t.Helper()
+		id, err := s.AddObservation(AddObservationParams{
+			SessionID: "s-title-dedupe", Type: "decision", Title: title,
+			Content: "Use JWT for auth", Project: "engram", Scope: "project",
+		})
+		if err != nil {
+			t.Fatalf("add observation %q: %v", title, err)
+		}
+		return id
+	}
+	first := save("Fix auth")
+	for _, title := range []string{"fix auth", "Fix  auth", "  FIX AUTH  "} {
+		if got := save(title); got != first {
+			t.Fatalf("title %q created observation %d, want duplicate of %d", title, got, first)
+		}
+	}
+	obs, err := s.GetObservation(first)
+	if err != nil {
+		t.Fatalf("get observation: %v", err)
+	}
+	if obs.DuplicateCount != 4 {
+		t.Fatalf("duplicate_count = %d, want 4", obs.DuplicateCount)
+	}
+	if obs.Title != "Fix auth" {
+		t.Fatalf("title = %q, want the first spelling kept", obs.Title)
+	}
+	if got := save("Fix auth v2"); got == first {
+		t.Fatal("a genuinely different title must not be treated as a duplicate")
+	}
+}
+
 func TestObservationWritesStoreProjectAsText(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("s-project-storage", "engram", "/tmp/engram"); err != nil {
