@@ -12860,10 +12860,12 @@ func normalizeTopicKey(topic string) string {
 		return ""
 	}
 	v = strings.Join(strings.Fields(v), "-")
-	if len(v) > 120 {
-		v = v[:120]
-	}
-	return v
+	// The budget stays 120 bytes so every key that was already valid keeps
+	// the exact value earlier builds stored (topic upserts compare keys
+	// verbatim). Only the cut moves back to the nearest rune boundary: a
+	// plain byte slice could split a multi-byte character and persist an
+	// invalid UTF-8 key.
+	return truncateUTF8Prefix(v, 120)
 }
 
 func derefString(v *string) string {

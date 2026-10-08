@@ -2683,6 +2683,79 @@ func TestUpdateObservationPreservesProjectAsTextAndProjectVisibility(t *testing.
 	}
 }
 
+// TestNormalizeTopicKeyCutsOnRuneBoundaryWithinByteBudget pins the topic key
+// truncation fix without changing any key that was already valid. The budget
+// is 120 bytes, as before: a byte slice at 120 could split a multi-byte
+// character and persist invalid UTF-8, while a 120-rune cut (up to 480 bytes)
+// would change the key of every long multi-byte topic saved by earlier builds
+// and turn their upserts into duplicate rows.
+func TestNormalizeTopicKeyCutsOnRuneBoundaryWithinByteBudget(t *testing.T) {
+	// legacyKey is what main stored for this topic: lower-case, fields joined
+	// with "-", then v[:120] (the cut lands on an ASCII "a", so it was valid).
+	topic := "decisión/" + strings.Repeat("a", 130)
+	legacyKey := strings.Join(strings.Fields(strings.ToLower(topic)), "-")[:120]
+	if !utf8.ValidString(legacyKey) || len(legacyKey) != 120 {
+		t.Fatalf("test fixture: legacy key must be a valid 120-byte key, got %d bytes", len(legacyKey))
+	}
+
+	t.Run("cut inside a rune moves back to the rune boundary", func(t *testing.T) {
+		accented := normalizeTopicKey("decision/" + strings.Repeat("é", 150))
+		if !utf8.ValidString(accented) {
+			t.Fatalf("expected a valid UTF-8 topic key, got %q", accented)
+		}
+		if len(accented) > 120 {
+			t.Fatalf("expected at most 120 bytes, got %d", len(accented))
+		}
+		if !strings.HasPrefix(accented, "decision/é") {
+			t.Fatalf("expected the key to keep its prefix, got %q", accented)
+		}
+	})
+
+	t.Run("key that was valid under the byte cut is unchanged", func(t *testing.T) {
+		if got := normalizeTopicKey(topic); got != legacyKey {
+			t.Fatalf("normalizeTopicKey changed a key that was already valid: got %q (%d bytes), want %q (%d bytes)", got, len(got), legacyKey, len(legacyKey))
+		}
+	})
+
+	t.Run("row stored with the legacy key is still the upsert target", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("s-topic-bytes", "engram", "/tmp/engram"); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		first, err := s.AddObservation(AddObservationParams{
+			SessionID: "s-topic-bytes", Type: "decision", Title: "Long topic v1",
+			Content: "first revision", Project: "engram", Scope: "project", TopicKey: legacyKey,
+		})
+		if err != nil {
+			t.Fatalf("seed observation with legacy key: %v", err)
+		}
+		before, err := s.GetObservation(first)
+		if err != nil {
+			t.Fatalf("get seeded observation: %v", err)
+		}
+		second, err := s.AddObservation(AddObservationParams{
+			SessionID: "s-topic-bytes", Type: "decision", Title: "Long topic v2",
+			Content: "second revision", Project: "engram", Scope: "project", TopicKey: topic,
+		})
+		if err != nil {
+			t.Fatalf("re-save observation with the untruncated topic: %v", err)
+		}
+		if second != first {
+			t.Fatalf("re-saving the topic created observation %d instead of upserting %d", second, first)
+		}
+		obs, err := s.GetObservation(first)
+		if err != nil {
+			t.Fatalf("get observation: %v", err)
+		}
+		if obs.RevisionCount != before.RevisionCount+1 || obs.Title != "Long topic v2" {
+			t.Fatalf("expected one upsert revision with the new title, got revision_count=%d (was %d) title=%q", obs.RevisionCount, before.RevisionCount, obs.Title)
+		}
+		if obs.TopicKey == nil || *obs.TopicKey != legacyKey {
+			t.Fatalf("stored topic key = %v, want the legacy key", obs.TopicKey)
+		}
+	})
+}
+
 func TestAddObservationRejectsBlankTitleBeforePersistenceAndSync(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("s-admission", "engram", "/tmp/engram"); err != nil {
